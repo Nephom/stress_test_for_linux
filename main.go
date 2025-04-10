@@ -570,316 +570,515 @@ func memoryTest(wg *sync.WaitGroup, stop chan struct{}, errorChan chan string, m
 	}
 }
 
-// --- 修正後的 performDiskWrite ---
+// --- performDiskWrite (保持不變，因為邏輯看起來是健壯的) ---
 func performDiskWrite(filePath string, data []byte, mode string, blockSize int64) (err error) {
-    // 使用 os.OpenFile 以便更清晰地控制標誌
-    file, err := os.OpenFile(filePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
-    if err != nil {
-        return fmt.Errorf("failed to open/create file for writing (%s): %w", filePath, err)
+	// 檢查文件是否已存在，如存在則先移除 (保持健壯性)
+	// 注意：在高並發或權限受限環境下，這裡可能需要更細緻的錯誤處理或重試
+	if _, statErr := os.Stat(filePath); statErr == nil {
+		if rmErr := os.Remove(filePath); rmErr != nil {
+			// 如果移除失敗，可能表示權限問題或文件被鎖定，這本身就是一個需要報告的問題
+			return fmt.Errorf("failed to remove existing file (%s): %w", filePath, rmErr)
+		}
+	} else if !os.IsNotExist(statErr) {
+        // 如果 Stat 返回的不是 "不存在" 錯誤，也報告它
+        return fmt.Errorf("failed to stat file before write (%s): %w", filePath, statErr)
     }
-    
-    // 不使用 defer 自動關閉，改為在每個錯誤處理和函數末尾手動關閉
 
-    totalSize := int64(len(data))
 
-    if mode == "sequential" {
-        // --- 順序寫入 ---
-        bytesWritten := int64(0)
-        for bytesWritten < totalSize {
-            chunkSize := blockSize
-            if totalSize-bytesWritten < chunkSize {
-                chunkSize = totalSize - bytesWritten
+	// 檢查資料長度
+	if len(data) == 0 {
+		return fmt.Errorf("attempt to write empty data to file %s", filePath)
+	}
+
+	// 使用 os.OpenFile 以便更清晰地控制標誌
+	file, err := os.OpenFile(filePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
+	if err != nil {
+		return fmt.Errorf("failed to open/create file for writing (%s): %w", filePath, err)
+	}
+	// **注意：** 這裡開始，任何 return 都必須確保 file 被關閉
+
+	totalSize := int64(len(data))
+	var totalBytesWritten int64 = 0
+
+	if mode == "sequential" {
+		// --- 順序寫入 ---
+		n, writeErr := file.Write(data)
+		totalBytesWritten = int64(n) // 記錄實際寫入量
+		if writeErr != nil {
+			file.Close() // 錯誤前關閉文件
+			return fmt.Errorf("sequential write error on %s after writing %d bytes: %w", filePath, totalBytesWritten, writeErr)
+		}
+		if totalBytesWritten != totalSize {
+			file.Close() // 錯誤前關閉文件
+			return fmt.Errorf("sequential write short write on %s: wrote %d bytes, expected %d", filePath, totalBytesWritten, totalSize)
+		}
+	} else { // mode == "random"
+		// --- 隨機寫入 ---
+		// 首先填充文件到正確的大小 (Truncate)
+        // 注意: Truncate 在某些系統/FS 上可能只是邏輯擴展，不一定物理分配，但 WriteAt 會觸發物理分配
+		if err := file.Truncate(totalSize); err != nil {
+			file.Close()
+			return fmt.Errorf("failed to truncate file to required size %d for (%s): %w", totalSize, filePath, err)
+		}
+
+		blocks := totalSize / blockSize
+		if totalSize%blockSize > 0 {
+			blocks++
+		}
+
+		blockOrder := make([]int64, blocks)
+		for i := int64(0); i < blocks; i++ {
+			blockOrder[i] = i
+		}
+        // 使用確定性的隨機源可能更有利於調試，但 time.Now() 用於壓力測試是常見的
+		source := rand.NewSource(time.Now().UnixNano())
+		rng := rand.New(source)
+		rng.Shuffle(int(blocks), func(i, j int) {
+			blockOrder[i], blockOrder[j] = blockOrder[j], blockOrder[i]
+		})
+
+		for _, blockIdx := range blockOrder {
+			start := blockIdx * blockSize
+			end := start + blockSize
+			if end > totalSize {
+				end = totalSize
+			}
+			chunkSize := end - start
+			if chunkSize <= 0 {
+				continue // 理論上不應該發生，除非 totalSize=0 或 blockSize <= 0 (已被外部檢查過)
+			}
+
+            if start >= int64(len(data)) || end > int64(len(data)) {
+                file.Close()
+                return fmt.Errorf("internal logic error: calculated range [%d:%d] exceeds data length %d", start, end, len(data))
             }
-            n, writeErr := file.Write(data[bytesWritten : bytesWritten+chunkSize])
-            if writeErr != nil {
-                file.Close() // 錯誤前關閉文件
-                return fmt.Errorf("sequential write error on %s at offset %d: %w", filePath, bytesWritten, writeErr)
-            }
-            if int64(n) != chunkSize {
-                file.Close() // 錯誤前關閉文件
-                return fmt.Errorf("sequential write short write on %s: wrote %d bytes, expected %d", filePath, n, chunkSize)
-            }
-            bytesWritten += int64(n)
+
+			n, writeErr := file.WriteAt(data[start:end], start)
+			totalBytesWritten += int64(n) // 累加實際寫入量
+			if writeErr != nil {
+				file.Close() // 錯誤前關閉文件
+				return fmt.Errorf("random write error on %s at offset %d after writing %d bytes for this chunk: %w", filePath, start, n, writeErr)
+			}
+			if int64(n) != chunkSize {
+				file.Close() // 錯誤前關閉文件
+				return fmt.Errorf("random write short write on %s at offset %d: wrote %d bytes, expected %d", filePath, start, n, chunkSize)
+			}
+		}
+         // 隨機寫入後，再次檢查總寫入量 (雙重保險)
+        if totalBytesWritten != totalSize {
+            file.Close()
+            return fmt.Errorf("random write total bytes written mismatch: wrote %d bytes, expected %d for %s", totalBytesWritten, totalSize, filePath)
         }
-    } else {
-        // --- 隨機寫入 ---
-        blocks := totalSize / blockSize
-        if totalSize%blockSize > 0 {
-            blocks++
-        }
+	}
 
-        blockOrder := make([]int64, blocks)
-        for i := int64(0); i < blocks; i++ {
-            blockOrder[i] = i
-        }
-        source := rand.NewSource(time.Now().UnixNano())
-        rng := rand.New(source)
-        rng.Shuffle(int(blocks), func(i, j int) {
-            blockOrder[i], blockOrder[j] = blockOrder[j], blockOrder[i]
-        })
+	// --- 強制同步數據到磁碟 ---
+	if syncErr := file.Sync(); syncErr != nil {
+		file.Close() // 錯誤前關閉文件
+		// Sync 失敗是嚴重問題，可能表示磁碟問題或權限不足
+		return fmt.Errorf("failed to sync file (%s) after writing %d bytes: %w", filePath, totalBytesWritten, syncErr)
+	}
 
-        for _, blockIdx := range blockOrder {
-            start := blockIdx * blockSize
-            end := start + blockSize
-            if end > totalSize {
-                end = totalSize
-            }
-            chunkSize := end - start
-            if chunkSize <= 0 {
-                continue
-            }
+	// --- 正確關閉文件 ---
+	if closeErr := file.Close(); closeErr != nil {
+		// 即使 Sync 成功，Close 也可能失敗 (雖然少見)
+		return fmt.Errorf("failed to close file (%s) after writing and sync: %w", filePath, closeErr)
+	}
 
-            n, writeErr := file.WriteAt(data[start:end], start)
-            if writeErr != nil {
-                file.Close() // 錯誤前關閉文件
-                return fmt.Errorf("random write error on %s at offset %d: %w", filePath, start, writeErr)
-            }
-            if int64(n) != chunkSize {
-                file.Close() // 錯誤前關閉文件
-                return fmt.Errorf("random write short write on %s at offset %d: wrote %d bytes, expected %d", filePath, start, n, chunkSize)
-            }
-        }
-    }
+	// --- 最終驗證：文件系統報告的大小 ---
+	// 這是寫操作成功的最後一道關卡
+	fileInfo, statErr := os.Stat(filePath)
+	if statErr != nil {
+		// 如果 Stat 失敗，即使前面都成功，也意味著有問題
+		return fmt.Errorf("final file verification failed after close (%s): cannot stat file: %w", filePath, statErr)
+	}
 
-    // --- 強制同步數據到磁碟 ---
-    if syncErr := file.Sync(); syncErr != nil {
-        file.Close() // 錯誤前關閉文件
-        return fmt.Errorf("failed to sync file (%s) after writing: %w", filePath, syncErr)
-    }
+	// 檢查文件大小
+	if fileInfo.Size() != totalSize {
+		// 如果大小不匹配，說明寫入操作最終沒有按預期完成
+		return fmt.Errorf("final file size verification failed: expected %d bytes, got %d bytes for file %s",
+			totalSize, fileInfo.Size(), filePath)
+	}
 
-    // --- 正確關閉文件 ---
-    if closeErr := file.Close(); closeErr != nil {
-        return fmt.Errorf("failed to close file (%s) after writing and sync: %w", filePath, closeErr)
-    }
-
-    // 確保文件已完全寫入並可以被讀取 - 可選的額外驗證
-    // 這一步是防止在寫入後讀取時發生問題
-    if _, statErr := os.Stat(filePath); statErr != nil {
-        return fmt.Errorf("file verification failed after writing (%s): %w", filePath, statErr)
-    }
-
-    return nil
+	// 所有檢查通過，返回 nil
+	return nil
 }
+
 
 // --- 修正後的 performDiskReadAndVerify ---
 func performDiskReadAndVerify(filePath string, originalData []byte, mode string, blockSize int64) error {
-    // 檢查文件是否存在且可訪問
-    if _, statErr := os.Stat(filePath); statErr != nil {
-        return fmt.Errorf("file not accessible for reading (%s): %w", filePath, statErr)
-    }
-    
-    file, err := os.Open(filePath) // 只讀模式打開
-    if err != nil {
-        return fmt.Errorf("failed to open file for reading (%s): %w", filePath, err)
-    }
-    defer file.Close() // 確保文件被關閉
+	expectedSize := int64(len(originalData))
 
-    // 獲取文件信息
-    fileInfo, err := file.Stat()
-    if err != nil {
-        return fmt.Errorf("failed to get file info (%s): %w", filePath, err)
-    }
-    totalSize := fileInfo.Size()
-    expectedSize := int64(len(originalData))
+	// 1. 檢查文件是否存在且可訪問，並獲取大小
+	fileInfo, statErr := os.Stat(filePath)
+	if statErr != nil {
+		if os.IsNotExist(statErr) {
+			return fmt.Errorf("file not found for reading (%s): %w", filePath, statErr)
+		}
+		return fmt.Errorf("file not accessible for reading (%s): cannot stat file: %w", filePath, statErr)
+	}
 
-    // 文件大小驗證
-    if totalSize != expectedSize {
-        return fmt.Errorf("file size mismatch on %s: expected %d bytes, got %d bytes", filePath, expectedSize, totalSize)
-    }
+	// 2. 文件大小驗證 (讀取前的第一道關卡)
+	totalSize := fileInfo.Size()
+	if totalSize != expectedSize {
+		return fmt.Errorf("file size mismatch before reading %s: expected %d bytes, found %d bytes", filePath, expectedSize, totalSize)
+	}
+	// 如果預期大小為 0，無需讀取，直接成功
+	if expectedSize == 0 {
+		return nil
+	}
 
-    // 準備讀取緩衝區
-    readData := make([]byte, totalSize)
+	// 3. 打開文件進行讀取
+	file, err := os.Open(filePath) // 只讀模式打開
+	if err != nil {
+		return fmt.Errorf("failed to open file for reading (%s): %w", filePath, err)
+	}
+	defer file.Close() // 確保文件最終被關閉
 
-    if mode == "sequential" {
-        // --- 順序讀取 ---
-        // 改為一次性讀取整個文件，這樣更可靠
-        n, readErr := io.ReadFull(file, readData)
-        if readErr != nil && readErr != io.EOF {
-            return fmt.Errorf("sequential read error on %s: %w", filePath, readErr)
-        }
-        if int64(n) != totalSize {
-            return fmt.Errorf("sequential read size mismatch on %s: read %d bytes, expected %d", filePath, n, totalSize)
-        }
-    } else {
-        // --- 隨機讀取 ---
-        blocks := totalSize / blockSize
-        if totalSize%blockSize > 0 {
-            blocks++
-        }
+	// 4. 準備讀取緩衝區
+	// 使用 stat 獲取的大小，而不是 len(originalData)，雖然它們此時應該相等
+	readData := make([]byte, totalSize)
 
-        blockOrder := make([]int64, blocks)
-        for i := int64(0); i < blocks; i++ {
-            blockOrder[i] = i
-        }
-        source := rand.NewSource(time.Now().UnixNano())
-        rng := rand.New(source)
-        rng.Shuffle(int(blocks), func(i, j int) {
-            blockOrder[i], blockOrder[j] = blockOrder[j], blockOrder[i]
-        })
+	if mode == "sequential" {
+		// --- 順序讀取 ---
+		// 使用 io.ReadFull 來確保讀滿緩衝區
+		n, readErr := io.ReadFull(file, readData)
 
-        for _, blockIdx := range blockOrder {
-            start := blockIdx * blockSize
-            end := start + blockSize
-            if end > totalSize {
-                end = totalSize
+		// 檢查 ReadFull 的結果
+		if readErr != nil {
+			// 如果錯誤是 io.ErrUnexpectedEOF，說明文件比 Stat 報告的要短，這是一個嚴重的不一致
+			if readErr == io.ErrUnexpectedEOF {
+				return fmt.Errorf("sequential read error on %s: file was shorter than expected (read %d bytes, expected %d). Inconsistency detected: %w", filePath, n, totalSize, readErr)
+			}
+			// 其他任何錯誤都是讀取失敗
+			return fmt.Errorf("sequential read error on %s after reading %d bytes: %w", filePath, n, readErr)
+		}
+		// 如果 readErr 為 nil，ReadFull 保證 n == len(readData) == totalSize
+		// 下面的檢查理論上是多餘的，但保留作為額外的斷言
+		if int64(n) != totalSize {
+			return fmt.Errorf("internal inconsistency: ReadFull returned nil error but read %d bytes, expected %d for %s", n, totalSize, filePath)
+		}
+	} else { // mode == "random"
+		// --- 隨機讀取 ---
+		// 與寫入時相同的塊計算和隨機化邏輯
+		blocks := totalSize / blockSize
+		if totalSize%blockSize > 0 {
+			blocks++
+		}
+
+		blockOrder := make([]int64, blocks)
+		for i := int64(0); i < blocks; i++ {
+			blockOrder[i] = i
+		}
+		// 注意：為了驗證，讀取的隨機順序最好與寫入時不同，或者使用固定的隨機種子
+        // 但對於壓力測試，每次不同也可以接受
+		source := rand.NewSource(time.Now().UnixNano() + 1) // 加 1 避免與寫入完全相同
+		rng := rand.New(source)
+		rng.Shuffle(int(blocks), func(i, j int) {
+			blockOrder[i], blockOrder[j] = blockOrder[j], blockOrder[i]
+		})
+
+        var totalBytesRead int64 = 0
+		for _, blockIdx := range blockOrder {
+			start := blockIdx * blockSize
+			end := start + blockSize
+			if end > totalSize {
+				end = totalSize
+			}
+			chunkSize := end - start
+			if chunkSize <= 0 {
+				continue
+			}
+
+            // 確保讀取的切片範圍有效
+            if start >= int64(len(readData)) || end > int64(len(readData)) {
+                 return fmt.Errorf("internal logic error during random read: calculated range [%d:%d] exceeds buffer length %d", start, end, len(readData))
             }
-            chunkSize := end - start
-            if chunkSize <= 0 {
-                continue
-            }
 
-            n, readErr := file.ReadAt(readData[start:end], start)
-            if readErr != nil && readErr != io.EOF {
-                return fmt.Errorf("random read error on %s at offset %d: %w", filePath, start, readErr)
-            }
-            // 對於最後一個區塊，可能會有 EOF，但應該已讀取了所有數據
-            if int64(n) != chunkSize {
-                return fmt.Errorf("random read short read on %s at offset %d: read %d bytes, expected %d", filePath, start, n, chunkSize)
-            }
+			// 從文件讀取到 readData 的 *對應位置*
+			n, readErr := file.ReadAt(readData[start:end], start)
+            totalBytesRead += int64(n)
+
+			// 檢查短讀 (最常見的錯誤)
+			if int64(n) != chunkSize {
+				// 即使錯誤是 EOF，只要讀到的字節數不等於期望的 chunkSize，就是有問題
+				// (除非 chunkSize 為 0，但前面已經 continue 了)
+				return fmt.Errorf("random read short read on %s at offset %d: read %d bytes, expected %d (error: %v)", filePath, start, n, chunkSize, readErr)
+			}
+
+			// 檢查讀取錯誤 (排除預期的 EOF)
+			// 如果 n == chunkSize，那麼 err 只能是 nil 或 io.EOF (當且僅當讀取的剛好是文件的最後一個字節)
+			if readErr != nil && readErr != io.EOF {
+				return fmt.Errorf("random read error on %s at offset %d after reading %d bytes for this chunk: %w", filePath, start, n, readErr)
+			}
+		}
+        // 隨機讀取後，可以選擇性地再檢查一次總讀取量
+        // 這有助於捕捉 block 計算或循環中的邏輯錯誤
+        // 注意：這裡的 totalBytesRead 可能不等於 totalSize，因為塊是隨機讀取的，
+        // 我們關心的是每個塊是否讀取正確，以及最終數據是否匹配。
+        // 因此，這個檢查可能不是很有用，除非你想驗證塊計算邏輯。
+        /*
+        if totalBytesRead != totalSize { // 這個檢查可能不適用於隨機讀取驗證
+             return fmt.Errorf("random read total bytes read mismatch: read %d bytes, expected %d for %s", totalBytesRead, totalSize, filePath)
         }
-    }
+        */
+	}
 
-    // --- 執行數據驗證 ---
-    if !bytes.Equal(originalData, readData) {
-        // 尋找第一個不匹配的字節
-        var mismatchPos int64 = -1
-        for i := range originalData {
-            if i >= len(readData) || originalData[i] != readData[i] {
-                mismatchPos = int64(i)
-                break
-            }
+	// --- 5. 執行數據驗證 ---
+	if !bytes.Equal(originalData, readData) {
+		// 如果數據不匹配，查找第一個差異點以提供更多信息
+		mismatchPos := int64(-1)
+		var originalByte, readByte byte
+		limit := len(originalData)
+		if len(readData) < limit {
+			limit = len(readData) // 防止比較時 readData 越界
+		}
+
+		for i := 0; i < limit; i++ {
+			if originalData[i] != readData[i] {
+				mismatchPos = int64(i)
+				originalByte = originalData[i]
+				readByte = readData[i]
+				break
+			}
+		}
+        // 如果循環結束還沒找到差異，但長度不同 (理論上已被前面的大小檢查攔截)
+        if mismatchPos == -1 && len(originalData) != len(readData) {
+            mismatchPos = int64(limit) // 差異發生在較短數據的末尾
+            if len(originalData) > limit { originalByte = originalData[limit] }
+            // readByte 保持 0 或默認值
         }
-        return fmt.Errorf("data verification failed for file %s: read data does not match original data (first mismatch at byte %d)", filePath, mismatchPos)
-    }
 
-    return nil
+		return fmt.Errorf("data verification failed for file %s: read data does not match original data (lengths: original=%d, read=%d). First mismatch at byte %d (original: %d[0x%X], read: %d[0x%X])",
+			filePath, len(originalData), len(readData), mismatchPos, originalByte, originalByte, readByte, readByte)
+	}
+
+	// 所有驗證通過
+	return nil
 }
 
-func diskTest(wg *sync.WaitGroup, stop chan struct{}, errorChan chan string, memIntegrationChan chan []byte, config DiskTestConfig, perfStats *PerformanceStats, debug bool) {
-    defer wg.Done()
 
-    if len(config.MountPoints) == 0 {
-        config.MountPoints = []string{"."}
-    }
-    if config.FileSize <= 0 {
-        config.FileSize = 10 * 1024 * 1024 // Default 10MB
-    }
-    if config.BlockSize <= 0 {
-        config.BlockSize = 4 * 1024 // Default 4KB
+// --- 修正後的 diskTest ---
+func diskTest(wg *sync.WaitGroup, stop chan struct{}, errorChan chan string, config DiskTestConfig, perfStats *PerformanceStats, debug bool) {
+	defer wg.Done()
+
+	if len(config.MountPoints) == 0 {
+		logMessage("No mount points specified, using current directory '.'", true)
+		config.MountPoints = []string{"."}
+	}
+	if config.FileSize <= 0 {
+		logMessage(fmt.Sprintf("Invalid FileSize %d, using default 10MB", config.FileSize), true)
+		config.FileSize = 10 * 1024 * 1024 // Default 10MB
+	}
+	if config.BlockSize <= 0 {
+		logMessage(fmt.Sprintf("Invalid BlockSize %d, using default 4KB", config.BlockSize), true)
+		config.BlockSize = 4 * 1024 // Default 4KB
+	}
+	if config.FileSize < config.BlockSize && config.TestMode != "sequential" {
+        // 對於隨機模式，文件大小至少要等於塊大小才有意義（儘管代碼能處理）
+        logMessage(fmt.Sprintf("Warning: FileSize (%s) is smaller than BlockSize (%s) for random/both mode.", formatSize(config.FileSize), formatSize(config.BlockSize)), true)
     }
 
-    // 處理 both 模式
-    var testModes []string
-    if config.TestMode == "both" {
-        testModes = []string{"sequential", "random"}
-    } else {
-        testModes = []string{config.TestMode}
-    }
 
-    // 為每個掛載點啟動一個 goroutine
-    for _, mountPoint := range config.MountPoints {
-        wg.Add(1)
-        go func(mp string) {
-            defer wg.Done()
+	// 處理 both 模式
+	var testModes []string
+	if config.TestMode == "both" {
+		testModes = []string{"sequential", "random"}
+	} else if config.TestMode == "sequential" || config.TestMode == "random" {
+		testModes = []string{config.TestMode}
+	} else {
+		errorMsg := fmt.Sprintf("Invalid test mode: %s. Use 'sequential', 'random', or 'both'.", config.TestMode)
+		errorChan <- errorMsg
+		logMessage(errorMsg, true)
+		return
+	}
 
-            // 創建測試數據 (在循環外創建一次即可)
-            data := make([]byte, config.FileSize)
-            if _, err := rand.Read(data); err != nil {
-                errorMsg := fmt.Sprintf("Failed to generate random data for %s: %v", mp, err)
-                errorChan <- errorMsg
-                logMessage(errorMsg, true) // Log critical error
-                return
+	// 為每個掛載點啟動一個 goroutine
+	mountWg := &sync.WaitGroup{} // 用於等待所有掛載點的 goroutine 完成
+	for _, mountPoint := range config.MountPoints {
+		mountWg.Add(1)
+		go func(mp string) {
+			defer mountWg.Done()
+
+			// 檢查掛載點是否存在且可寫入
+			if info, err := os.Stat(mp); err != nil {
+				errorMsg := fmt.Sprintf("Mount point %s not accessible: %v", mp, err)
+				errorChan <- errorMsg
+				logMessage(errorMsg, true)
+				return
+			} else if !info.IsDir() {
+				errorMsg := fmt.Sprintf("Mount point %s is not a directory", mp)
+				errorChan <- errorMsg
+				logMessage(errorMsg, true)
+				return
+			}
+            // 嘗試在掛載點創建一個臨時文件來檢查寫權限
+            tempFilePath := filepath.Join(mp, fmt.Sprintf(".writetest_%d", time.Now().UnixNano()))
+            tempFile, err := os.Create(tempFilePath)
+            if err != nil {
+                errorMsg := fmt.Sprintf("Mount point %s is not writable: %v", mp, err)
+				errorChan <- errorMsg
+				logMessage(errorMsg, true)
+				return
+            }
+            tempFile.Close()
+            os.Remove(tempFilePath) // 清理臨時文件
+
+
+			// 檢查磁盤空間 (需要兩倍空間：一個用於寫入，一個用於可能的系統緩存/操作)
+            // 這個檢查可能不完全準確，但作為預防措施
+			var stat syscall.Statfs_t
+            requiredSpace := uint64(config.FileSize) * 2 // 請求至少兩倍文件大小的空間
+			if err := syscall.Statfs(mp, &stat); err == nil {
+				availableBytes := stat.Bavail * uint64(stat.Bsize) // 可用空間 (非 root 用戶)
+				if availableBytes < requiredSpace {
+					errorMsg := fmt.Sprintf("Insufficient disk space on %s: required approx %s, available %s",
+						mp, formatSize(int64(requiredSpace)), formatSize(int64(availableBytes)))
+					errorChan <- errorMsg
+					logMessage(errorMsg, true)
+					return
+				}
+                 logMessage(fmt.Sprintf("Disk space check on %s: OK (Available: %s, Required: approx %s)", mp, formatSize(int64(availableBytes)), formatSize(int64(requiredSpace))), debug)
+			} else {
+                logMessage(fmt.Sprintf("Warning: Could not check disk space on %s: %v. Proceeding anyway.", mp, err), true)
             }
 
-            // 內存集成 (可以放在循環外)
-            select {
-            case memIntegrationChan <- data:
-                logMessage(fmt.Sprintf("Sent %s of data to memory integration from %s",
-                           formatSize(config.FileSize), mp), debug)
-            default:
-                // Channel full or no receiver
-            }
+			// 創建測試數據 (在模式循環之外創建一次)
+            logMessage(fmt.Sprintf("Generating %s of random data for tests on %s...", formatSize(config.FileSize), mp), debug)
+			data := make([]byte, config.FileSize)
+			if _, err := rand.Read(data); err != nil {
+				errorMsg := fmt.Sprintf("Failed to generate random data for %s: %v", mp, err)
+				errorChan <- errorMsg
+				logMessage(errorMsg, true)
+				return
+			}
+             logMessage(fmt.Sprintf("Random data generated for %s.", mp), debug)
 
-            // 針對 both 模式，需要對每種模式分別進行測試
-            for _, mode := range testModes {
-                filePath := filepath.Join(mp, fmt.Sprintf("stress_test_%s.dat", mode))
-                logMessage(fmt.Sprintf("Starting disk test on mount point: %s (mode: %s, size: %s, block: %s)",
-                          mp, mode, formatSize(config.FileSize), formatSize(config.BlockSize)), debug)
 
-                diskPerf := DiskPerformance{
-                    MountPoint: mp,
-                    Mode:       mode,
-                    BlockSize:  config.BlockSize,
-                }
+			// 針對每種測試模式進行測試
+			modeWg := &sync.WaitGroup{} // 用於等待同一掛載點下不同模式的測試完成
+			for _, mode := range testModes {
+				modeWg.Add(1)
+				go func(currentMode string) {
+					defer modeWg.Done()
+					filePath := filepath.Join(mp, fmt.Sprintf("stress_test_%s_%d.dat", currentMode, rand.Intn(10000))) // 加隨機數避免衝突
 
-                for {
-                    select {
-                    case <-stop:
-                        os.Remove(filePath) // 清理測試文件
-                        logMessage(fmt.Sprintf("Disk test stopped on %s (mode: %s)", mp, mode), debug)
-                        return
-                    default:
-                        // --- 寫入測試 ---
-                        writeStart := time.Now()
-                        if err := performDiskWrite(filePath, data, mode, config.BlockSize); err != nil {
-                            errorMsg := fmt.Sprintf("Disk write error on %s (mode: %s): %v", mp, mode, err)
-                            errorChan <- errorMsg
-                            logMessage(errorMsg, true) // Log error
-                            time.Sleep(1 * time.Second) // 發生錯誤時稍等久一點再重試
-                            continue
-                        }
-                        writeDuration := time.Since(writeStart)
-                        writeSpeedMBps := float64(config.FileSize) / writeDuration.Seconds() / (1024 * 1024)
-                        logMessage(fmt.Sprintf("Disk write on %s (mode: %s): %.2f MB/s (%s in %v)",
-                                  mp, mode, writeSpeedMBps, formatSize(config.FileSize), writeDuration), debug)
+                    // 在 goroutine 開始時記錄，確保能追蹤到啟動
+                    logMessage(fmt.Sprintf("Starting disk test goroutine for mount point: %s (mode: %s, file: %s, size: %s, block: %s)",
+							mp, currentMode, filepath.Base(filePath), formatSize(config.FileSize), formatSize(config.BlockSize)), debug)
 
-                        // --- 讀取和驗證測試 ---
-                        readStart := time.Now()
-                        // 確保讀取和寫入使用相同的模式
-                        if err := performDiskReadAndVerify(filePath, data, mode, config.BlockSize); err != nil {
-                            errorMsg := fmt.Sprintf("Disk read/verify error on %s (mode: %s): %v", mp, mode, err)
-                            errorChan <- errorMsg
-                            logMessage(errorMsg, true) // Log error
-                            time.Sleep(1 * time.Second) // 發生錯誤時稍等久一點再重試
-                            continue
-                        }
-                        readDuration := time.Since(readStart)
-                        readSpeedMBps := float64(config.FileSize) / readDuration.Seconds() / (1024 * 1024)
-                        logMessage(fmt.Sprintf("Disk read/verify on %s (mode: %s): %.2f MB/s (%s in %v)",
-                                  mp, mode, readSpeedMBps, formatSize(config.FileSize), readDuration), debug)
+					// 循環執行讀寫測試直到收到停止信號
+					iteration := 0
+					for {
+                        iteration++
+                        logMessage(fmt.Sprintf("Mount %s, Mode %s, Iteration %d: Starting cycle.", mp, currentMode, iteration), debug)
 
-                        // --- 更新性能統計 ---
-                        perfStats.mu.Lock()
-                        diskPerf.ReadSpeed = readSpeedMBps
-                        diskPerf.WriteSpeed = writeSpeedMBps
+						select {
+						case <-stop:
+							os.Remove(filePath) // 清理測試文件
+							logMessage(fmt.Sprintf("Disk test stopped on %s (mode: %s, file: %s)", mp, currentMode, filepath.Base(filePath)), debug)
+							return // 退出此模式的 goroutine
+						default:
+							// --- 寫入測試 ---
+                            logMessage(fmt.Sprintf("Mount %s, Mode %s, Iteration %d: Performing write...", mp, currentMode, iteration), debug)
+							writeStart := time.Now()
+							writeErr := performDiskWrite(filePath, data, currentMode, config.BlockSize)
+                            writeDuration := time.Since(writeStart)
 
-                        found := false
-                        for i, dp := range perfStats.Disk {
-                            if dp.MountPoint == mp && dp.Mode == mode && dp.BlockSize == config.BlockSize {
-                                // 只更新最佳性能
-                                if readSpeedMBps > dp.ReadSpeed {
-                                    perfStats.Disk[i].ReadSpeed = readSpeedMBps
+							if writeErr != nil {
+								errorMsg := fmt.Sprintf("Disk write error on %s (mode: %s, file: %s, iter: %d, duration: %v): %v", mp, currentMode, filepath.Base(filePath), iteration, writeDuration, writeErr)
+								errorChan <- errorMsg
+								logMessage(errorMsg, true) // Log error
+                                os.Remove(filePath) // 寫入失敗後嘗試清理
+								time.Sleep(2 * time.Second) // 發生錯誤時稍等更久
+								continue // 繼續下一次循環嘗試
+							}
+
+							// 寫入成功，計算速度
+							writeSpeedMBps := float64(0)
+							if writeDuration.Seconds() > 0 {
+								writeSpeedMBps = float64(config.FileSize) / writeDuration.Seconds() / (1024 * 1024)
+							}
+							logMessage(fmt.Sprintf("Disk write on %s (mode: %s, iter: %d): %.2f MB/s (%s in %v)",
+								mp, currentMode, iteration, writeSpeedMBps, formatSize(config.FileSize), writeDuration), debug)
+
+							// --- 讀取和驗證測試 ---
+                            logMessage(fmt.Sprintf("Mount %s, Mode %s, Iteration %d: Performing read and verify...", mp, currentMode, iteration), debug)
+							readStart := time.Now()
+							// 確保讀取和寫入使用相同的模式
+							readErr := performDiskReadAndVerify(filePath, data, currentMode, config.BlockSize)
+                            readDuration := time.Since(readStart)
+
+							if readErr != nil {
+								errorMsg := fmt.Sprintf("Disk read/verify error on %s (mode: %s, file: %s, iter: %d, duration: %v): %v", mp, currentMode, filepath.Base(filePath), iteration, readDuration, readErr)
+								errorChan <- errorMsg
+								logMessage(errorMsg, true) // Log error
+                                os.Remove(filePath) // 讀取/驗證失敗後也嘗試清理
+								time.Sleep(2 * time.Second) // 發生錯誤時稍等更久
+								continue // 繼續下一次循環嘗試
+							}
+
+                            // 讀取和驗證成功，計算速度
+							readSpeedMBps := float64(0)
+							if readDuration.Seconds() > 0 {
+								readSpeedMBps = float64(config.FileSize) / readDuration.Seconds() / (1024 * 1024)
+							}
+							logMessage(fmt.Sprintf("Disk read/verify on %s (mode: %s, iter: %d): %.2f MB/s (%s in %v)",
+								mp, currentMode, iteration, readSpeedMBps, formatSize(config.FileSize), readDuration), debug)
+
+							// --- 更新性能統計 (只記錄最佳性能) ---
+							perfStats.mu.Lock()
+                            diskPerfKey := fmt.Sprintf("%s|%s|%d", mp, currentMode, config.BlockSize)
+                            found := false
+                            for i, dp := range perfStats.Disk {
+                                // 使用組合鍵來查找匹配的記錄
+                                existingKey := fmt.Sprintf("%s|%s|%d", dp.MountPoint, dp.Mode, dp.BlockSize)
+                                if existingKey == diskPerfKey {
+                                     if readSpeedMBps > dp.ReadSpeed {
+                                        perfStats.Disk[i].ReadSpeed = readSpeedMBps
+                                        logMessage(fmt.Sprintf("Updated best read speed for %s: %.2f MB/s", diskPerfKey, readSpeedMBps), debug)
+                                    }
+                                    if writeSpeedMBps > dp.WriteSpeed {
+                                        perfStats.Disk[i].WriteSpeed = writeSpeedMBps
+                                        logMessage(fmt.Sprintf("Updated best write speed for %s: %.2f MB/s", diskPerfKey, writeSpeedMBps), debug)
+                                    }
+                                    found = true
+                                    break
                                 }
-                                if writeSpeedMBps > dp.WriteSpeed {
-                                    perfStats.Disk[i].WriteSpeed = writeSpeedMBps
-                                }
-                                found = true
-                                break
                             }
-                        }
-                        if !found {
-                            newPerf := diskPerf
-                            perfStats.Disk = append(perfStats.Disk, newPerf)
-                        }
-                        perfStats.mu.Unlock()
+                            if !found {
+                                // 如果是第一次記錄這個組合，則添加新條目
+                                newPerf := DiskPerformance{
+                                    MountPoint: mp,
+                                    Mode:       currentMode,
+                                    BlockSize:  config.BlockSize,
+                                    ReadSpeed:  readSpeedMBps,
+                                    WriteSpeed: writeSpeedMBps,
+                                }
+                                perfStats.Disk = append(perfStats.Disk, newPerf)
+                                logMessage(fmt.Sprintf("Added initial perf record for %s: Read=%.2f MB/s, Write=%.2f MB/s", diskPerfKey, readSpeedMBps, writeSpeedMBps), debug)
+                            }
+							perfStats.mu.Unlock()
 
-                        // 短暫延遲避免 CPU/Disk 滿載
-                        time.Sleep(100 * time.Millisecond)
-                    }
-                }
-            }
-        }(mountPoint)
-    }
+							// 可選：每次成功循環後清理文件，避免佔用過多空間（但會增加 I/O 開銷）
+							// if err := os.Remove(filePath); err != nil {
+                            //     logMessage(fmt.Sprintf("Warning: Failed to remove test file %s after successful cycle: %v", filePath, err), true)
+                            // }
+
+							// 短暫延遲避免 CPU/Disk 滿載，並給系統一些喘息時間
+                            logMessage(fmt.Sprintf("Mount %s, Mode %s, Iteration %d: Cycle completed successfully. Sleeping.", mp, currentMode, iteration), debug)
+							time.Sleep(150 * time.Millisecond) // 稍微增加延遲
+						}
+					} // end infinite loop for mode
+				}(mode) // 傳遞 mode 的當前值
+			} // end loop over modes
+			modeWg.Wait() // 等待該掛載點的所有模式測試完成 (雖然理論上它們在收到 stop 前不會結束)
+            logMessage(fmt.Sprintf("All test modes finished or stopped for mount point %s.", mp), debug)
+		}(mountPoint) // 傳遞 mountPoint 的當前值
+	} // end loop over mount points
+
+	// 等待所有掛載點的 goroutine 完成 (通常是收到 stop 信號後)
+	mountWg.Wait()
+    logMessage("All mount point test goroutines have finished.", debug)
 }
 
 // Logger function to handle both console output and file logging
@@ -1125,7 +1324,7 @@ func main() {
 				}
 
 				wg.Add(1)
-				go diskTest(&wg, stop, errorChan, memIntegrationChan, diskConfig, perfStats, debug)
+				go diskTest(&wg, stop, errorChan, diskConfig, perfStats, debug)
 			}
 		}
 	}
