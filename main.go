@@ -1361,20 +1361,14 @@ func main() {
 			logMessage(fmt.Sprintf("Starting CPU tests on NUMA node %d with %d CPUs", nodeIdx, len(cpus)), debug)
 
 			// Distribute different computation types across CPUs in this NUMA node
-			for i, cpuID := range cpus {
-				testType := i % 3 // 0=integer, 1=float, 2=vector
-
-				switch testType {
-				case 0:
-					wg.Add(1)
-					go integerComputation(&wg, stop, errorChan, nodeIdx, cpuID, perfStats, debug)
-				case 1:
-					wg.Add(1)
-					go floatComputation(&wg, stop, errorChan, nodeIdx, cpuID, perfStats, debug)
-				case 2:
-					wg.Add(1)
-					go vectorComputation(&wg, stop, errorChan, nodeIdx, cpuID, perfStats, debug)
-				}
+			for _, cpuID := range cpus {
+				wg.Add(3)
+				// Interger
+				go integerComputation(&wg, stop, errorChan, nodeIdx, cpuID, perfStats, debug)
+				//Float
+				go floatComputation(&wg, stop, errorChan, nodeIdx, cpuID, perfStats, debug)
+				//Vector
+				go vectorComputation(&wg, stop, errorChan, nodeIdx, cpuID, perfStats, debug)
 			}
 		}
 	}
