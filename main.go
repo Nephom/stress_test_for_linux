@@ -170,7 +170,7 @@ func getNUMAInfo() (NUMAInfo, error) {
 // Integer computation with NUMA awareness
 func integerComputation(wg *sync.WaitGroup, stop chan struct{}, errorChan chan string, numaNode int, cpuID int, perfStats *PerformanceStats, debug bool) {
 	defer wg.Done()
-	
+
 	// Set CPU affinity if supported
 	if runtime.GOOS == "linux" {
 		// This is simplified - actual affinity setting would use cgo or syscalls
@@ -180,20 +180,71 @@ func integerComputation(wg *sync.WaitGroup, stop chan struct{}, errorChan chan s
 		}
 	}
 
-	startTime := time.Now()
-	operations := uint64(0)
 	var x int64 = 1
-	
+	operations := uint64(0)
+
 	for {
 		select {
 		case <-stop:
-			// Calculate GFLOPS
+			if debug {
+				logMessage(fmt.Sprintf("Integer computation on CPU %d completed", cpuID), debug)
+			}
+			return
+		default:
+			x += 3
+			x *= 2
+			x /= 2
+			operations++
+
+			if x < 0 {
+				errorChan <- "Integer overflow detected!"
+			}
+		}
+	}
+}
+
+// Float computation with NUMA awareness
+func floatComputation(wg *sync.WaitGroup, stop chan struct{}, errorChan chan string, numaNode int, cpuID int, perfStats *PerformanceStats, debug bool) {
+	defer wg.Done()
+
+	testName := "FloatComputation"
+
+	// Set CPU affinity if supported
+	if runtime.GOOS == "linux" {
+		if debug {
+			logMessage(fmt.Sprintf("Running float computation on NUMA node %d, CPU %d", numaNode, cpuID), debug)
+		}
+	}
+
+	startTime := time.Now()
+	lastUpdateTime := startTime
+	operations := uint64(0)
+	operationsSinceLastUpdate := uint64(0)
+	var x float64 = 1.1
+
+	// Count floating point operations per iteration
+	// Accurately counting floating point operations:
+	// - math.Sqrt(): typically 15-20 flops in hardware implementation
+	// - multiplication: 1 flop
+	// - addition: 1 flop
+	// - division: 1 flop
+	// Using conservative estimate: 2 sqrt * 15 + 1 add + 1 mult + 1 div = 33 flops
+	const flopsPerIteration = 33
+
+	// Update GFLOPS value periodically (every 5 seconds)
+	updateInterval := 5 * time.Second
+
+	for {
+		select {
+		case <-stop:
+			// Calculate final GFLOPS more accurately
 			duration := time.Since(startTime).Seconds()
-			flops := float64(operations * 3) // 3 operations per iteration
-			gflops := 0.0
-			if duration > 0 { // 避免除以零
-			    gflops = flops / duration / 1e9
-		        }
+			totalFlops := float64(operations * flopsPerIteration)
+
+			var gflops float64 = 0.0
+			if duration > 0 {
+				gflops = totalFlops / duration / 1e9
+			}
 
 			perfStats.mu.Lock()
 			if gflops > perfStats.CPU.GFLOPS {
@@ -202,18 +253,97 @@ func integerComputation(wg *sync.WaitGroup, stop chan struct{}, errorChan chan s
 			perfStats.mu.Unlock()
 
 			if debug {
-				logMessage(fmt.Sprintf("Integer computation on CPU %d completed: %.2f GFLOPS", cpuID, gflops), debug)
+				logMessage(fmt.Sprintf("Float computation on CPU %d completed: %.2f GFLOPS", cpuID, gflops), debug)
 			}
 			return
 		default:
-			x += 3
-			x *= 2
-			x /= 2
+			oldX := x
+			x = math.Sqrt(x) * math.Sqrt(x)
+			x += 1.00001
+			x *= 1.00001
+			x /= 1.00001
+
 			operations++
-			
-			if x < 0 {
-				errorChan <- "Integer overflow detected!"
+			operationsSinceLastUpdate++
+
+			// Periodically update GFLOPS value for progress reporting
+			if time.Since(lastUpdateTime) > updateInterval {
+				duration := time.Since(lastUpdateTime).Seconds()
+				currentGflops := 0.0
+
+				if duration > 0 {
+					currentGflops = float64(operationsSinceLastUpdate * flopsPerIteration) / duration / 1e9
+
+					perfStats.mu.Lock()
+					if currentGflops > perfStats.CPU.GFLOPS {
+						perfStats.CPU.GFLOPS = currentGflops
+					}
+					perfStats.mu.Unlock()
+
+					if debug {
+						logMessage(fmt.Sprintf("Interim GFLOPS update on CPU %d: %.2f GFLOPS", cpuID, currentGflops), debug)
+					}
+				}
+
+				lastUpdateTime = time.Now()
+				operationsSinceLastUpdate = 0
 			}
+
+			// Debug output for very large operation counts
+			if debug && operations%10000000 == 0 {
+				duration := time.Since(startTime).Seconds()
+				if duration > 0 {
+					currentTotalGflops := float64(operations * flopsPerIteration) / duration / 1e9
+					logMessage(fmt.Sprintf("Progress on CPU %d: %.2f GFLOPS after %d million operations",
+						cpuID, currentTotalGflops, operations/1000000), debug)
+				}
+			}
+
+			if math.IsNaN(x) {
+				logError(errorChan, testName, fmt.Sprintf("NaN detected! Previous value: %.6f", oldX))
+			}
+		}
+	}
+}
+
+// Vector computation with NUMA awareness
+func vectorComputation(wg *sync.WaitGroup, stop chan struct{}, errorChan chan string, numaNode int, cpuID int, perfStats *PerformanceStats, debug bool) {
+	defer wg.Done()
+
+	// Set CPU affinity if supported
+	if runtime.GOOS == "linux" {
+		if debug {
+			logMessage(fmt.Sprintf("Running vector computation on NUMA node %d, CPU %d", numaNode, cpuID), debug)
+		}
+	}
+
+	vecSize := 1024
+	a := make([]float64, vecSize)
+	b := make([]float64, vecSize)
+	c := make([]float64, vecSize)
+
+	for i := 0; i < vecSize; i++ {
+		a[i] = float64(i)
+		b[i] = float64(i) * 1.5
+	}
+
+	iterations := uint64(0)
+
+	for {
+		select {
+		case <-stop:
+			if debug {
+				logMessage(fmt.Sprintf("Vector computation on CPU %d completed", cpuID), debug)
+			}
+			return
+		default:
+			for i := 0; i < vecSize; i++ {
+				c[i] = a[i] + b[i]*2.0 - math.Sqrt(b[i])
+				if math.IsNaN(c[i]) {
+					errorChan <- "Vector computation error detected!"
+				}
+			}
+			iterations++
 		}
 	}
 }
@@ -232,116 +362,6 @@ func logError(errorChan chan string, testName, errorMsg string) {
 	
 	// Also push to error channel
 	errorChan <- fullError
-}
-
-// Float computation with NUMA awareness
-func floatComputation(wg *sync.WaitGroup, stop chan struct{}, errorChan chan string, numaNode int, cpuID int, perfStats *PerformanceStats, debug bool) {
-	defer wg.Done()
-	
-	testName := "FloatComputation"
-	
-	// Set CPU affinity if supported
-	if runtime.GOOS == "linux" {
-		if debug {
-			logMessage(fmt.Sprintf("Running float computation on NUMA node %d, CPU %d", numaNode, cpuID), debug)
-		}
-	}
-
-	startTime := time.Now()
-	operations := uint64(0)
-	var x float64 = 1.1
-	
-	for {
-		select {
-		case <-stop:
-			// Calculate GFLOPS
-			duration := time.Since(startTime).Seconds()
-			flops := float64(operations * 5) // 5 operations per iteration (sqrt*2, add, mult, div)
-			gflops := 0.0
-			if duration > 0 { // 避免除以零
-			    gflops = flops / duration / 1e9
-		        }
-
-			perfStats.mu.Lock()
-			if gflops > perfStats.CPU.GFLOPS {
-				perfStats.CPU.GFLOPS = gflops
-			}
-			perfStats.mu.Unlock()
-
-			if debug {
-				logMessage(fmt.Sprintf("Float computation on CPU %d completed: %.2f GFLOPS", cpuID, gflops), debug)
-			}
-			return
-		default:
-			oldX := x
-			x = math.Sqrt(x) * math.Sqrt(x)
-			x += 1.00001
-			x *= 1.00001
-			x /= 1.00001
-			operations++
-			
-			if math.IsNaN(x) {
-				logError(errorChan, testName, fmt.Sprintf("NaN detected! Previous value: %.6f", oldX))
-			}
-		}
-	}
-}
-
-// Vector computation with NUMA awareness
-func vectorComputation(wg *sync.WaitGroup, stop chan struct{}, errorChan chan string, numaNode int, cpuID int, perfStats *PerformanceStats, debug bool) {
-	defer wg.Done()
-	
-	// Set CPU affinity if supported
-	if runtime.GOOS == "linux" {
-		if debug {
-			logMessage(fmt.Sprintf("Running vector computation on NUMA node %d, CPU %d", numaNode, cpuID), debug)
-		}
-	}
-
-	vecSize := 1024
-	a := make([]float64, vecSize)
-	b := make([]float64, vecSize)
-	c := make([]float64, vecSize)
-	
-	for i := 0; i < vecSize; i++ {
-		a[i] = float64(i)
-		b[i] = float64(i) * 1.5
-	}
-	
-	startTime := time.Now()
-	iterations := uint64(0)
-	
-	for {
-		select {
-		case <-stop:
-			// Calculate GFLOPS
-			duration := time.Since(startTime).Seconds()
-			flops := float64(iterations * uint64(vecSize) * 4) // 4 operations per vector element
-			gflops := 0.0
-			if duration > 0 { // 避免除以零
-			    gflops = flops / duration / 1e9
-		        }
-
-			perfStats.mu.Lock()
-			if gflops > perfStats.CPU.GFLOPS {
-				perfStats.CPU.GFLOPS = gflops
-			}
-			perfStats.mu.Unlock()
-
-			if debug {
-				logMessage(fmt.Sprintf("Vector computation on CPU %d completed: %.2f GFLOPS", cpuID, gflops), debug)
-			}
-			return
-		default:
-			for i := 0; i < vecSize; i++ {
-				c[i] = a[i] + b[i]*2.0 - math.Sqrt(b[i])
-				if math.IsNaN(c[i]) {
-					errorChan <- "Vector computation error detected!"
-				}
-			}
-			iterations++
-		}
-	}
 }
 
 func getSystemMemory() (total, free uint64) {
@@ -1219,7 +1239,7 @@ func main() {
 
 	// Performance stats tracking
 	perfStats := &PerformanceStats{
-		CPU:    CPUPerformance{},
+		CPU:    CPUPerformance{GFLOPS: 0.0},
 		Memory: MemoryPerformance{},
 		Disk:   []DiskPerformance{},
 	}
@@ -1227,7 +1247,6 @@ func main() {
 	var wg sync.WaitGroup
 	stop := make(chan struct{})
 	errorChan := make(chan string, 100) // Buffer for error messages
-	memIntegrationChan := make(chan []byte, 10) // Channel for memory-disk integration
 
 	// Track test results
 	results := TestResult{
@@ -1384,30 +1403,6 @@ func main() {
 		}
 	}()
 
-	// Memory-disk integration goroutine
-	go func() {
-		for data := range memIntegrationChan {
-			if testMemory {
-				if debug {
-					logMessage(fmt.Sprintf("Processing %s of data in memory integration", formatSize(int64(len(data)))), debug)
-				}
-
-				// Simulate processing the data in memory
-				checksum := uint64(0)
-				for i := 0; i < len(data); i += 8 {
-					if i+8 <= len(data) {
-						val := binary(data[i:i+8])
-						checksum ^= val
-					}
-				}
-
-				if debug {
-					logMessage(fmt.Sprintf("Memory integration checksum: %X", checksum), debug)
-				}
-			}
-		}
-	}()
-
 	// Setup progress reporting
 	progressTicker := time.NewTicker(30 * time.Second)
 	go func() {
@@ -1435,7 +1430,13 @@ func main() {
 				perfStats.mu.Unlock()
 
 				// Report progress
-				progressMsg := fmt.Sprintf("Progress update - CPU: %.2f GFLOPS (approximate value, not exact)", cpuGFLOPS)
+				var progressMsg string
+				if testCPU {
+					progressMsg = fmt.Sprintf("Progress update - CPU: %.2f GFLOPS (approximate value, not exact)", cpuGFLOPS)
+				} else {
+					progressMsg = "Progress update"
+				}
+
 				if testMemory {
 					progressMsg += fmt.Sprintf(", Memory: R=%.2f MB/s W=%.2f MB/s", memRead, memWrite)
 				}
@@ -1460,7 +1461,6 @@ func main() {
 
 	// Stop the test
 	close(stop)
-	close(memIntegrationChan)
 
 	// Wait for all tests to finish
 	wg.Wait()
@@ -1517,7 +1517,6 @@ func main() {
 	logMessage("Stress test completed!", true)
 }
 
-// binary converts a byte slice to a uint64, used for checksum calculation
 func binary(buf []byte) uint64 {
 	return uint64(buf[0]) | uint64(buf[1])<<8 | uint64(buf[2])<<16 | uint64(buf[3])<<24 |
 		uint64(buf[4])<<32 | uint64(buf[5])<<40 | uint64(buf[6])<<48 | uint64(buf[7])<<56
