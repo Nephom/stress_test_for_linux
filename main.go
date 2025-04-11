@@ -39,8 +39,17 @@ type DiskTestConfig struct {
 	BlockSize   int64    // Block size for read/write operations
 }
 
+//type CPUPerformance struct {
+//	GFLOPS float64
+//}
+
 type CPUPerformance struct {
-	GFLOPS float64
+    GFLOPS        float64            // 總體 GFLOPS
+    CoreGFLOPS    map[int]float64    // 每個核心的 GFLOPS
+    IntegerOPS    float64            // 整數運算性能
+    FloatOPS      float64            // 浮點運算性能
+    VectorOPS     float64            // 向量運算性能
+    NumCores      int                // 活躍核心數
 }
 
 type MemoryPerformance struct {
@@ -167,185 +176,297 @@ func getNUMAInfo() (NUMAInfo, error) {
 	return info, nil
 }
 
-// Integer computation with NUMA awareness
-func integerComputation(wg *sync.WaitGroup, stop chan struct{}, errorChan chan string, numaNode int, cpuID int, perfStats *PerformanceStats, debug bool) {
-	defer wg.Done()
+// runIntegerComputationParallel performs intensive integer operations on a specific CPU
+// and updates performance statistics
+func runIntegerComputationParallel(stop <-chan struct{}, errorChan chan<- string, cpuID int, perfStats *PerformanceStats, debug bool) {
+    if debug {
+        logMessage(fmt.Sprintf("Starting integer computation worker on CPU %d", cpuID), debug)
+    }
 
-	// Set CPU affinity if supported
-	if runtime.GOOS == "linux" {
-		// This is simplified - actual affinity setting would use cgo or syscalls
-		// which is beyond the scope of this example
-		if debug {
-			logMessage(fmt.Sprintf("Running integer computation on NUMA node %d, CPU %d", numaNode, cpuID), debug)
-		}
-	}
+    // Variables for statistics
+    startTime := time.Now()
+    lastUpdateTime := startTime
+    operationCount := uint64(0)
 
-	var x int64 = 1
-	operations := uint64(0)
+    // Constants for computation
+    const batchSize = 10000000 // Number of operations per batch
+    const updateInterval = 2 * time.Second // Performance update interval
 
-	for {
-		select {
-		case <-stop:
-			if debug {
-				logMessage(fmt.Sprintf("Integer computation on CPU %d completed", cpuID), debug)
-			}
-			return
-		default:
-			x += 3
-			x *= 2
-			x /= 2
-			operations++
+    // Prime numbers for calculation
+    primes := []int{2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53}
 
-			if x < 0 {
-				errorChan <- "Integer overflow detected!"
-			}
-		}
-	}
+    // Error detection variables
+    var expectedResult int64 = 0
+    var errorDetected bool = false
+
+    // Main computation loop
+    for {
+        select {
+        case <-stop:
+            if debug {
+                elapsed := time.Since(startTime)
+                opsPerSecond := float64(operationCount) / elapsed.Seconds()
+                logMessage(fmt.Sprintf("Integer computation on CPU %d completed: %d operations (%.2f ops/sec)",
+                    cpuID, operationCount, opsPerSecond), debug)
+            }
+            return
+
+        default:
+            // Perform a batch of integer operations
+            for i := 0; i < batchSize; i++ {
+                // Complex integer computation
+                var result int64 = 1
+                for _, prime := range primes {
+                    result = (result * int64(prime)) % (1<<31 - 1) // Prevent overflow
+                    result = result ^ (result >> 3) // Bit manipulation
+                    result = result + int64(prime) // Addition
+                }
+
+                // Verify result for error detection
+                if i == 0 && operationCount == 0 {
+                    expectedResult = result
+                } else if !errorDetected && result != expectedResult {
+                    errorMsg := fmt.Sprintf("Integer computation error on CPU %d: Expected %d, got %d", cpuID, expectedResult, result)
+                    errorChan <- errorMsg
+                    errorDetected = true
+                }
+
+                operationCount++
+            }
+
+            // Update performance statistics periodically
+            now := time.Now()
+            if now.Sub(lastUpdateTime) >= updateInterval {
+                elapsed := now.Sub(startTime)
+                opsPerSecond := float64(operationCount) / elapsed.Seconds()
+
+                // Convert operations per second to GFLOPS equivalent
+                // Each operation involves multiple arithmetic operations
+                const opsPerFlop = 8 // Approximate integer ops per operation
+                gflopsEquivalent := (opsPerSecond * opsPerFlop) / 1e9
+
+                // Update performance stats
+                perfStats.mu.Lock()
+                // Add this CPU's contribution to the total
+                // This is a simplified approach - in a real app you might track per-CPU stats
+                perfStats.CPU.GFLOPS = (perfStats.CPU.GFLOPS + gflopsEquivalent) / 2 // Running average
+                perfStats.mu.Unlock()
+
+                if debug {
+                    logMessage(fmt.Sprintf("CPU %d integer perf: %.2f GOPS (%.2f GFLOPS equiv)",
+                        cpuID, opsPerSecond/1e9, gflopsEquivalent), debug)
+                }
+
+                lastUpdateTime = now
+            }
+        }
+    }
 }
 
-// Float computation with NUMA awareness
-func floatComputation(wg *sync.WaitGroup, stop chan struct{}, errorChan chan string, numaNode int, cpuID int, perfStats *PerformanceStats, debug bool) {
-	defer wg.Done()
+// runFloatComputationParallel performs intensive floating point operations on a specific CPU
+// and updates performance statistics
+func runFloatComputationParallel(stop <-chan struct{}, errorChan chan<- string, cpuID int, perfStats *PerformanceStats, debug bool) {
+    if debug {
+        logMessage(fmt.Sprintf("Starting float computation worker on CPU %d", cpuID), debug)
+    }
 
-	testName := "FloatComputation"
+    // Variables for statistics
+    startTime := time.Now()
+    lastUpdateTime := startTime
+    operationCount := uint64(0)
 
-	// Set CPU affinity if supported
-	if runtime.GOOS == "linux" {
-		if debug {
-			logMessage(fmt.Sprintf("Running float computation on NUMA node %d, CPU %d", numaNode, cpuID), debug)
-		}
-	}
+    // Constants for computation
+    const batchSize = 5000000 // Floating point ops are usually slower
+    const updateInterval = 2 * time.Second
 
-	startTime := time.Now()
-	lastUpdateTime := startTime
-	operations := uint64(0)
-	operationsSinceLastUpdate := uint64(0)
-	var x float64 = 1.1
+    // Constants for calculation
+    constants := []float64{3.14159, 2.71828, 1.41421, 1.73205, 2.23606, 2.44949, 2.64575}
 
-	// Count floating point operations per iteration
-	// Accurately counting floating point operations:
-	// - math.Sqrt(): typically 15-20 flops in hardware implementation
-	// - multiplication: 1 flop
-	// - addition: 1 flop
-	// - division: 1 flop
-	// Using conservative estimate: 2 sqrt * 15 + 1 add + 1 mult + 1 div = 33 flops
-	const flopsPerIteration = 33
+    // Error detection variables
+    var expectedResult float64 = 0
+    var errorDetected bool = false
+    var epsilon float64 = 1e-10 // Tolerance for floating point comparison
 
-	// Update GFLOPS value periodically (every 5 seconds)
-	updateInterval := 5 * time.Second
+    // Main computation loop
+    for {
+        select {
+        case <-stop:
+            if debug {
+                elapsed := time.Since(startTime)
+                opsPerSecond := float64(operationCount) / elapsed.Seconds()
+                logMessage(fmt.Sprintf("Float computation on CPU %d completed: %d operations (%.2f ops/sec)",
+                    cpuID, operationCount, opsPerSecond), debug)
+            }
+            return
 
-	for {
-		select {
-		case <-stop:
-			// Calculate final GFLOPS more accurately
-			duration := time.Since(startTime).Seconds()
-			totalFlops := float64(operations * flopsPerIteration)
+        default:
+            // Perform a batch of floating point operations
+            for i := 0; i < batchSize; i++ {
+                // Complex floating point computation with transcendental functions
+                var result float64 = 1.0
+                for _, c := range constants {
+                    result = result * math.Sin(c) + math.Cos(result)
+                    result = math.Sqrt(math.Abs(result)) + math.Log(1 + math.Abs(result))
+                    result = math.Pow(result, 0.5) * c
+                }
 
-			var gflops float64 = 0.0
-			if duration > 0 {
-				gflops = totalFlops / duration / 1e9
-			}
+                // Verify result for error detection (allowing for small floating point differences)
+                if i == 0 && operationCount == 0 {
+                    expectedResult = result
+                } else if !errorDetected && math.Abs(result-expectedResult) > epsilon {
+                    errorMsg := fmt.Sprintf("Float computation error on CPU %d: Expected %.10f, got %.10f, diff %.10f",
+                        cpuID, expectedResult, result, math.Abs(result-expectedResult))
+                    errorChan <- errorMsg
+                    errorDetected = true
+                }
 
-			perfStats.mu.Lock()
-			if gflops > perfStats.CPU.GFLOPS {
-				perfStats.CPU.GFLOPS = gflops
-			}
-			perfStats.mu.Unlock()
+                operationCount++
+            }
 
-			if debug {
-				logMessage(fmt.Sprintf("Float computation on CPU %d completed: %.2f GFLOPS", cpuID, gflops), debug)
-			}
-			return
-		default:
-			oldX := x
-			x = math.Sqrt(x) * math.Sqrt(x)
-			x += 1.00001
-			x *= 1.00001
-			x /= 1.00001
+            // Update performance statistics periodically
+            now := time.Now()
+            if now.Sub(lastUpdateTime) >= updateInterval {
+                elapsed := now.Sub(startTime)
+                opsPerSecond := float64(operationCount) / elapsed.Seconds()
 
-			operations++
-			operationsSinceLastUpdate++
+                // Convert operations per second to GFLOPS
+                // Each operation involves multiple floating point operations
+                const flopsPerOp = 12 // Approximate FLOPS per operation
+                gflops := (opsPerSecond * flopsPerOp) / 1e9
 
-			// Periodically update GFLOPS value for progress reporting
-			if time.Since(lastUpdateTime) > updateInterval {
-				duration := time.Since(lastUpdateTime).Seconds()
-				currentGflops := 0.0
+                // Update performance stats
+                perfStats.mu.Lock()
+                // Add this CPU's contribution to the total
+                perfStats.CPU.GFLOPS = (perfStats.CPU.GFLOPS + gflops) / 2 // Running average
+                perfStats.mu.Unlock()
 
-				if duration > 0 {
-					currentGflops = float64(operationsSinceLastUpdate * flopsPerIteration) / duration / 1e9
+                if debug {
+                    logMessage(fmt.Sprintf("CPU %d float perf: %.2f GFLOPS", cpuID, gflops), debug)
+                }
 
-					perfStats.mu.Lock()
-					if currentGflops > perfStats.CPU.GFLOPS {
-						perfStats.CPU.GFLOPS = currentGflops
-					}
-					perfStats.mu.Unlock()
-
-					if debug {
-						logMessage(fmt.Sprintf("Interim GFLOPS update on CPU %d: %.2f GFLOPS", cpuID, currentGflops), debug)
-					}
-				}
-
-				lastUpdateTime = time.Now()
-				operationsSinceLastUpdate = 0
-			}
-
-			// Debug output for very large operation counts
-			if debug && operations%10000000 == 0 {
-				duration := time.Since(startTime).Seconds()
-				if duration > 0 {
-					currentTotalGflops := float64(operations * flopsPerIteration) / duration / 1e9
-					logMessage(fmt.Sprintf("Progress on CPU %d: %.2f GFLOPS after %d million operations",
-						cpuID, currentTotalGflops, operations/1000000), debug)
-				}
-			}
-
-			if math.IsNaN(x) {
-				logError(errorChan, testName, fmt.Sprintf("NaN detected! Previous value: %.6f", oldX))
-			}
-		}
-	}
+                lastUpdateTime = now
+            }
+        }
+    }
 }
 
-// Vector computation with NUMA awareness
-func vectorComputation(wg *sync.WaitGroup, stop chan struct{}, errorChan chan string, numaNode int, cpuID int, perfStats *PerformanceStats, debug bool) {
-	defer wg.Done()
+// runVectorComputationParallel performs SIMD-like vector operations to stress CPU
+// and updates performance statistics
+func runVectorComputationParallel(stop <-chan struct{}, errorChan chan<- string, cpuID int, perfStats *PerformanceStats, debug bool) {
+    if debug {
+        logMessage(fmt.Sprintf("Starting vector computation worker on CPU %d", cpuID), debug)
+    }
 
-	// Set CPU affinity if supported
-	if runtime.GOOS == "linux" {
-		if debug {
-			logMessage(fmt.Sprintf("Running vector computation on NUMA node %d, CPU %d", numaNode, cpuID), debug)
-		}
-	}
+    // Variables for statistics
+    startTime := time.Now()
+    lastUpdateTime := startTime
+    operationCount := uint64(0)
 
-	vecSize := 1024
-	a := make([]float64, vecSize)
-	b := make([]float64, vecSize)
-	c := make([]float64, vecSize)
+    // Constants for computation
+    const vectorSize = 1024 // Size of vectors to process
+    const batchSize = 1000  // Number of vector operations per batch
+    const updateInterval = 2 * time.Second
 
-	for i := 0; i < vecSize; i++ {
-		a[i] = float64(i)
-		b[i] = float64(i) * 1.5
-	}
+    // Create vectors for computation
+    vecA := make([]float64, vectorSize)
+    vecB := make([]float64, vectorSize)
+    vecC := make([]float64, vectorSize)
 
-	iterations := uint64(0)
+    // Initialize vectors with some values
+    for i := 0; i < vectorSize; i++ {
+        vecA[i] = float64(i % 17) * 0.5
+        vecB[i] = float64(i % 19) * 0.75
+    }
 
-	for {
-		select {
-		case <-stop:
-			if debug {
-				logMessage(fmt.Sprintf("Vector computation on CPU %d completed", cpuID), debug)
-			}
-			return
-		default:
-			for i := 0; i < vecSize; i++ {
-				c[i] = a[i] + b[i]*2.0 - math.Sqrt(b[i])
-				if math.IsNaN(c[i]) {
-					errorChan <- "Vector computation error detected!"
-				}
-			}
-			iterations++
-		}
-	}
+    // Error detection variables
+    var checksum float64 = 0
+    var expectedChecksum float64 = 0
+    var errorDetected bool = false
+    var epsilon float64 = 1e-10
+
+    // Main computation loop
+    for {
+        select {
+        case <-stop:
+            if debug {
+                elapsed := time.Since(startTime)
+                opsPerSecond := float64(operationCount) / elapsed.Seconds()
+                logMessage(fmt.Sprintf("Vector computation on CPU %d completed: %d operations (%.2f ops/sec)",
+                    cpuID, operationCount, opsPerSecond), debug)
+            }
+            return
+
+        default:
+            // Perform a batch of vector operations
+            for b := 0; b < batchSize; b++ {
+                // Vector addition, multiplication, and dot product
+                dotProduct := 0.0
+
+                for i := 0; i < vectorSize; i++ {
+                    // Vector operations
+                    vecC[i] = vecA[i] + vecB[i]               // Addition
+                    vecC[i] = vecC[i] * (vecA[i] * vecB[i])   // Multiplication
+                    vecC[i] = math.Sqrt(math.Abs(vecC[i]))    // Element-wise function
+
+                    // Accumulate dot product
+                    dotProduct += vecA[i] * vecB[i]
+                }
+
+                // Calculate checksum for error detection
+                checksum = dotProduct
+
+                // Verify checksum for error detection
+                if b == 0 && operationCount == 0 {
+                    expectedChecksum = checksum
+                } else if !errorDetected && math.Abs(checksum-expectedChecksum) > epsilon {
+                    errorMsg := fmt.Sprintf("Vector computation error on CPU %d: Expected checksum %.10f, got %.10f",
+                        cpuID, expectedChecksum, checksum)
+                    errorChan <- errorMsg
+                    errorDetected = true
+                }
+
+                operationCount++
+            }
+
+            // Update performance statistics periodically
+            now := time.Now()
+            if now.Sub(lastUpdateTime) >= updateInterval {
+                elapsed := now.Sub(startTime)
+                opsPerSecond := float64(operationCount) / elapsed.Seconds()
+
+                // Convert vector operations to GFLOPS
+                // Each vector operation involves multiple floating point operations
+                // For vector size of 1024, each batch operation is approximately:
+                // 1024 * 5 = ~5K FLOPS (addition, 2 multiplications, sqrt, abs)
+                flopsPerVectorOp := float64(vectorSize * 5)
+                gflops := (opsPerSecond * flopsPerVectorOp) / 1e9
+
+                // Update performance stats
+                perfStats.mu.Lock()
+                // Add this CPU's contribution to the total
+                perfStats.CPU.GFLOPS = (perfStats.CPU.GFLOPS + gflops) / 2 // Running average
+                perfStats.mu.Unlock()
+
+                if debug {
+                    logMessage(fmt.Sprintf("CPU %d vector perf: %.2f GFLOPS", cpuID, gflops), debug)
+                }
+
+                lastUpdateTime = now
+            }
+        }
+    }
+}
+
+// Helper function to update the CPUPerformance with an atomic operation
+// (this would need to be added to your code)
+func updateCPUPerformance(perfStats *PerformanceStats, cpuID int, gflops float64) {
+    perfStats.mu.Lock()
+    defer perfStats.mu.Unlock()
+
+    // You might want to store per-CPU stats in a real application
+    // For simplicity, we're just updating the overall GFLOPS
+    // This is a simple running average - you might want a more sophisticated approach
+    perfStats.CPU.GFLOPS = (perfStats.CPU.GFLOPS + gflops) / 2
 }
 
 func logError(errorChan chan string, testName, errorMsg string) {
@@ -1349,29 +1470,87 @@ func main() {
 	}
 
 	// Start CPU tests if enabled
-	if testCPU {
-		logMessage(fmt.Sprintf("Starting CPU stress tests using %d cores...", runtime.NumCPU()), debug)
-
-		// Distribute CPU tasks across NUMA nodes
-		for nodeIdx, cpus := range numaInfo.NodeCPUs {
-			if len(cpus) == 0 {
-				continue
-			}
-
-			logMessage(fmt.Sprintf("Starting CPU tests on NUMA node %d with %d CPUs", nodeIdx, len(cpus)), debug)
-
-			// Distribute different computation types across CPUs in this NUMA node
-			for _, cpuID := range cpus {
-				wg.Add(3)
-				// Interger
-				go integerComputation(&wg, stop, errorChan, nodeIdx, cpuID, perfStats, debug)
-				//Float
-				go floatComputation(&wg, stop, errorChan, nodeIdx, cpuID, perfStats, debug)
-				//Vector
-				go vectorComputation(&wg, stop, errorChan, nodeIdx, cpuID, perfStats, debug)
-			}
-		}
-	}
+if testCPU {
+    logMessage(fmt.Sprintf("Starting CPU stress tests using %d cores...", runtime.NumCPU()), debug)
+    
+    // Get total available CPUs across all NUMA nodes
+    var allCPUs []int
+    for _, cpus := range numaInfo.NodeCPUs {
+        allCPUs = append(allCPUs, cpus...)
+    }
+    
+    if len(allCPUs) == 0 {
+        // Fallback if no NUMA info available
+        for i := 0; i < runtime.NumCPU(); i++ {
+            allCPUs = append(allCPUs, i)
+        }
+    }
+    
+    logMessage(fmt.Sprintf("Running parallel tests on %d CPU cores", len(allCPUs)), debug)
+    
+    // Create a shared work pool for integer computations
+    wg.Add(1)
+    go func() {
+        defer wg.Done()
+        var innerWg sync.WaitGroup
+        
+        // Launch worker for each CPU
+        for _, cpuID := range allCPUs {
+            innerWg.Add(1)
+            go func(id int) {
+                defer innerWg.Done()
+                // Pin this goroutine to the specific CPU if possible
+                runtime.LockOSThread()
+                // Run integer computation until stop signal
+                runIntegerComputationParallel(stop, errorChan, id, perfStats, debug)
+            }(cpuID)
+        }
+        
+        innerWg.Wait()
+    }()
+    
+    // Create a shared work pool for floating point computations
+    wg.Add(1) 
+    go func() {
+        defer wg.Done()
+        var innerWg sync.WaitGroup
+        
+        // Launch worker for each CPU
+        for _, cpuID := range allCPUs {
+            innerWg.Add(1)
+            go func(id int) {
+                defer innerWg.Done()
+                // Pin this goroutine to the specific CPU if possible
+                runtime.LockOSThread()
+                // Run float computation until stop signal
+                runFloatComputationParallel(stop, errorChan, id, perfStats, debug)
+            }(cpuID)
+        }
+        
+        innerWg.Wait()
+    }()
+    
+    // Create a shared work pool for vector computations
+    wg.Add(1)
+    go func() {
+        defer wg.Done()
+        var innerWg sync.WaitGroup
+        
+        // Launch worker for each CPU
+        for _, cpuID := range allCPUs {
+            innerWg.Add(1)
+            go func(id int) {
+                defer innerWg.Done()
+                // Pin this goroutine to the specific CPU if possible
+                runtime.LockOSThread()
+                // Run vector computation until stop signal
+                runVectorComputationParallel(stop, errorChan, id, perfStats, debug)
+            }(cpuID)
+        }
+        
+        innerWg.Wait()
+    }()
+}
 
 	// Error collection goroutine
 	go func() {
